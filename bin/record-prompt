@@ -43,6 +43,10 @@
 #   record-prompt --compare SPECS run the same transcript through several
 #                                 condensers; SPECS = comma list of [backend:]model
 #                                 e.g. --compare "haiku,sonnet,opus,codex:gpt-5.5"
+#   record-prompt --seconds N     record for a fixed N seconds instead of
+#                                 waiting for a keypress (auto-set to 30 when
+#                                 no interactive terminal is available, e.g.
+#                                 some embedded/IDE terminals)
 #   record-prompt --raw           skip condensation; print the raw transcript
 #   record-prompt --text "..."    skip recording/transcription; condense the
 #                                 given text (also reads stdin: echo ... | record-prompt --text -)
@@ -96,6 +100,7 @@ usage() {
 # Arg parsing
 # ---------------------------------------------------------------------------
 RAW=0 KEEP_AUDIO=0 TEXT_INPUT="" COMPARE=""
+REC_SECONDS="${RECORD_PROMPT_SECONDS:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --raw)         RAW=1 ;;
@@ -103,6 +108,9 @@ while [[ $# -gt 0 ]]; do
     --condenser)   shift; [[ $# -gt 0 ]] || die "--condenser requires an argument"; CONDENSER="$1" ;;
     --model)       shift; [[ $# -gt 0 ]] || die "--model requires an argument"; MODEL="$1" ;;
     --transcriber) shift; [[ $# -gt 0 ]] || die "--transcriber requires an argument"; TRANSCRIBER="$1" ;;
+    --seconds)     shift; [[ $# -gt 0 ]] || die "--seconds requires an argument"
+                   [[ "$1" =~ ^[0-9]+$ && "$1" -gt 0 ]] || die "--seconds must be a positive integer"
+                   REC_SECONDS="$1" ;;
     --compare)     shift; [[ $# -gt 0 ]] || die "--compare requires an argument"; COMPARE="$1" ;;
     --text)        shift; [[ $# -gt 0 ]] || die "--text requires an argument (or '-' for stdin)"
                    if [[ "$1" == "-" ]]; then TEXT_INPUT="$(cat)"; else TEXT_INPUT="$1"; fi ;;
@@ -115,9 +123,20 @@ done
 # ---------------------------------------------------------------------------
 # Recording
 # ---------------------------------------------------------------------------
+# Without an interactive terminal (some embedded/IDE terminals, the desktop
+# app) there is no way to receive a stop keypress — fall back to a fixed
+# recording window instead of hanging forever.
+ensure_stoppable() {
+  if [[ -z "$REC_SECONDS" && "$TTY_IN" != /dev/tty ]]; then
+    REC_SECONDS=30
+    ui "  (no interactive terminal — recording for ${REC_SECONDS}s; use --seconds N to change)"
+  fi
+}
+
 # Native Windows (Git Bash / MSYS): Unix signals don't reliably stop a
-# backgrounded recorder, so run ffmpeg in the foreground reading the tty —
-# ffmpeg stops cleanly (valid WAV header) when you press 'q'.
+# backgrounded recorder, so ffmpeg runs in the foreground — stopped by a
+# fixed duration (-t) or by pressing 'q' on the tty (both end with a valid
+# WAV header).
 record_audio_windows() {
   local out="$1" dev="${RECORD_PROMPT_MIC:-}"
   command -v ffmpeg >/dev/null 2>&1 \
@@ -130,15 +149,23 @@ record_audio_windows() {
 then set RECORD_PROMPT_MIC=\"<device name>\""
   fi
   ui ""
-  ui "  ● Recording from \"$dev\"... press q to stop."
-  ffmpeg -hide_banner -loglevel error -f dshow -i audio="$dev" \
-    -ac 1 -ar 16000 -y "$out" < "$TTY_IN" >/dev/null 2>&1 || true
+  if [[ -n "$REC_SECONDS" ]]; then
+    ui "  ● Recording from \"$dev\" for ${REC_SECONDS}s..."
+    ffmpeg -hide_banner -loglevel error -nostdin -f dshow -i audio="$dev" \
+      -t "$REC_SECONDS" -ac 1 -ar 16000 -y "$out" >/dev/null 2>&1 || true
+  else
+    ui "  ● Recording from \"$dev\"... press q to stop."
+    ffmpeg -hide_banner -loglevel error -f dshow -i audio="$dev" \
+      -ac 1 -ar 16000 -y "$out" < "$TTY_IN" >/dev/null 2>&1 || true
+  fi
   [[ -s "$out" ]] || die "recording produced no audio (check the device with RECORD_PROMPT_MIC)"
 }
 
 record_audio() {
   local out="$1" pid os
   os="$(uname -s)"
+
+  ensure_stoppable
 
   case "$os" in
     MINGW*|MSYS*|CYGWIN*) record_audio_windows "$out"; return ;;
@@ -147,31 +174,44 @@ record_audio() {
   local rec_out=/dev/null
   [[ "$HAVE_TTY_OUT" == 1 ]] && rec_out=/dev/tty
 
+  # Build the recorder command; each supports an optional fixed duration.
+  local -a cmd
   if command -v rec >/dev/null 2>&1; then                     # sox
-    rec -q -c 1 -r 16000 "$out" > "$rec_out" 2>&1 &
+    cmd=(rec -q -c 1 -r 16000 "$out")
+    [[ -n "$REC_SECONDS" ]] && cmd+=(trim 0 "$REC_SECONDS")
   elif command -v sox >/dev/null 2>&1; then
-    sox -q -d -c 1 -r 16000 "$out" > "$rec_out" 2>&1 &
+    cmd=(sox -q -d -c 1 -r 16000 "$out")
+    [[ -n "$REC_SECONDS" ]] && cmd+=(trim 0 "$REC_SECONDS")
   elif command -v arecord >/dev/null 2>&1; then               # ALSA (Linux)
-    arecord -q -f S16_LE -r 16000 -c 1 "$out" &
+    cmd=(arecord -q -f S16_LE -r 16000 -c 1)
+    [[ -n "$REC_SECONDS" ]] && cmd+=(-d "$REC_SECONDS")
+    cmd+=("$out")
   elif command -v ffmpeg >/dev/null 2>&1; then
+    local -a dur=()
+    [[ -n "$REC_SECONDS" ]] && dur=(-t "$REC_SECONDS")
     if [[ "$os" == "Darwin" ]]; then
-      ffmpeg -hide_banner -loglevel error -f avfoundation -i ":default" \
-        -ac 1 -ar 16000 -y "$out" &
+      cmd=(ffmpeg -hide_banner -loglevel error -nostdin -f avfoundation -i ":default"
+           "${dur[@]}" -ac 1 -ar 16000 -y "$out")
     else
-      ffmpeg -hide_banner -loglevel error -f pulse -i default \
-        -ac 1 -ar 16000 -y "$out" &
+      cmd=(ffmpeg -hide_banner -loglevel error -nostdin -f pulse -i default
+           "${dur[@]}" -ac 1 -ar 16000 -y "$out")
     fi
   else
     die "no recorder found — install one of: sox (recommended), alsa-utils (arecord), ffmpeg"
   fi
-  pid=$!
 
   ui ""
-  ui "  ● Recording... press Enter to stop."
-  IFS= read -r _ < "$TTY_IN" || true
-
-  kill -INT "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  if [[ -n "$REC_SECONDS" ]]; then
+    ui "  ● Recording for ${REC_SECONDS}s..."
+    "${cmd[@]}" > "$rec_out" 2>&1 || true
+  else
+    "${cmd[@]}" > "$rec_out" 2>&1 &
+    pid=$!
+    ui "  ● Recording... press Enter to stop."
+    IFS= read -r _ < "$TTY_IN" || true
+    kill -INT "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
 
   [[ -s "$out" ]] || die "recording produced no audio (is a microphone connected?)"
 }

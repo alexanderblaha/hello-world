@@ -72,6 +72,16 @@ Microphone access inside WSL2 comes through WSLg's PulseAudio passthrough
 (Windows 11, or Windows 10 with WSLg installed) — verify with `pactl info`;
 if a mic shows up, `sox`/`ffmpeg -f pulse` recording works.
 
+**Running Claude Code from PowerShell (VS Code terminal) or the desktop app?**
+You're on Option B without realizing it: Claude Code on native Windows executes
+`!` commands through Git Bash regardless of which shell hosts it, so
+`! bin/record-prompt` works from a PowerShell-hosted session once the Option B
+dependencies below are installed. One behavioral note: embedded terminals
+don't always give the script an interactive keyboard to receive the "stop"
+keypress — when that happens it automatically records for a fixed **30
+seconds** instead (it tells you so). Adjust with `--seconds N` (or
+`RECORD_PROMPT_SECONDS`): `! bin/record-prompt --seconds 60`.
+
 **Option B: native Git Bash.** Install the dependencies:
 
 ```sh
@@ -140,6 +150,7 @@ Or just invoke it by path from Claude Code: `! bin/record-prompt`.
 | `record-prompt --condenser codex` | condense via ChatGPT subscription (also: `claude-cli`, `api`, `openai-api`) |
 | `record-prompt --model sonnet` | pick the condenser model (`haiku`/`sonnet`/`opus` aliases or any full model ID) |
 | `record-prompt --transcriber openai` | force cloud STT instead of local whisper |
+| `record-prompt --seconds 60` | record a fixed duration instead of waiting for a keypress |
 | `record-prompt --compare "haiku,sonnet,opus,codex:gpt-5.5"` | run the same transcript through several condensers, labeled side by side |
 | `record-prompt --raw` | print the raw transcript (skip condensing) — for debugging |
 | `record-prompt --text "..."` | condense given text (no mic needed) — for testing |
@@ -173,6 +184,7 @@ CLI flags (`--condenser`, `--model`, `--transcriber`) override the env vars.
 | `RECORD_PROMPT_TRANSCRIBER` | auto (`local` if whisper found, else `openai`) | force `local` or `openai` |
 | `OPENAI_API_KEY` | — | enables the OpenAI audio-API fallback |
 | `RECORD_PROMPT_MIC` | auto-detected | (Windows/Git Bash only) DirectShow audio device name |
+| `RECORD_PROMPT_SECONDS` | — (interactive stop) | fixed recording duration; auto-set to 30 when no interactive terminal |
 | `RECORD_PROMPT_OPENAI_STT_MODEL` | `gpt-4o-mini-transcribe` | OpenAI STT model |
 
 ## Design decisions
