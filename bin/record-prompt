@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+#
+# record-prompt — voice input → token-optimized prompt for Claude Code
+#
+# Pipeline:
+#   1. Record mic audio (sox / arecord / ffmpeg) until you press Enter
+#   2. Transcribe locally with whisper.cpp (or the OpenAI audio API as fallback)
+#   3. Condense the rambling transcript into a tight prompt with Claude Haiku
+#   4. Print ONLY the condensed prompt to stdout
+#
+# Designed for Claude Code bash mode:  ! record-prompt
+# Claude Code captures BOTH stdout and stderr from ! commands into the model's
+# context, so every interactive/UI message here goes to /dev/tty instead —
+# the only bytes that ever reach the primary model are the final Haiku output.
+#
+# Environment:
+#   ANTHROPIC_API_KEY            required (or ANTHROPIC_AUTH_TOKEN from `ant auth login`)
+#   RECORD_PROMPT_MODEL          condenser model   (default: claude-haiku-4-5)
+#   RECORD_PROMPT_WHISPER_MODEL  path to a whisper.cpp ggml model
+#                                (default: ~/.local/share/whisper/ggml-base.en.bin)
+#   RECORD_PROMPT_TRANSCRIBER    "local" or "openai" (default: local, if a whisper
+#                                binary is found; otherwise openai if OPENAI_API_KEY set)
+#   OPENAI_API_KEY               only needed for the openai transcriber
+#
+# Usage:
+#   record-prompt                 record → transcribe → condense → stdout
+#   record-prompt --raw           skip condensation; print the raw transcript
+#   record-prompt --text "..."    skip recording/transcription; condense the
+#                                 given text (also reads stdin: echo ... | record-prompt --text -)
+#   record-prompt --keep-audio    don't delete the temporary wav file
+#   record-prompt -h | --help     this help
+
+set -euo pipefail
+
+MODEL="${RECORD_PROMPT_MODEL:-claude-haiku-4-5}"
+WHISPER_MODEL="${RECORD_PROMPT_WHISPER_MODEL:-$HOME/.local/share/whisper/ggml-base.en.bin}"
+TRANSCRIBER="${RECORD_PROMPT_TRANSCRIBER:-}"
+MAX_TOKENS=500
+
+SYSTEM_PROMPT='You compress rambling voice-transcribed requests into tight prompts for a coding agent.
+
+Rules:
+- Preserve every technical detail: file paths, function/class names, error messages, version numbers, flags, URLs, and explicit constraints or requirements.
+- Remove filler words, repetition, hedging, and thinking-out-loud.
+- When the speaker corrects or contradicts themselves, keep only their final intent.
+- Keep distinct requests as separate sentences or a short list; never merge unrelated asks.
+- Write the result as a direct instruction or question addressed to the agent, in the speaker'\''s voice ("Refactor X...", "Why does Y...").
+- Output ONLY the condensed prompt. No preamble, no quotes, no commentary, no markdown fences.
+- If the transcript is empty or contains no actionable request, output exactly: [no actionable request in recording]'
+
+# ---------------------------------------------------------------------------
+# UI plumbing: everything interactive goes to the terminal, never to stdout
+# or stderr (Claude Code captures both from ! commands).
+# ---------------------------------------------------------------------------
+# [[ -w /dev/tty ]] is not enough: the node can exist with no controlling
+# terminal, in which case opening it fails. Test with an actual open. The
+# no-tty fallback must be `>&2` (fd duplication), NOT `> /dev/stderr` — if
+# fd 2 is a regular file, reopening it by path truncates it.
+if { exec 3> /dev/tty; } 2>/dev/null; then exec 3>&-; HAVE_TTY_OUT=1; else HAVE_TTY_OUT=0; fi
+if { exec 3< /dev/tty; } 2>/dev/null; then exec 3<&-; TTY_IN=/dev/tty;  else TTY_IN=/dev/stdin; fi
+
+ui() {
+  if [[ "$HAVE_TTY_OUT" == 1 ]]; then printf '%s\n' "$*" > /dev/tty; else printf '%s\n' "$*" >&2; fi
+}
+die() { ui "record-prompt: error: $*"; exit 1; }
+
+usage() {
+  if [[ "$HAVE_TTY_OUT" == 1 ]]; then
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' > /dev/tty
+  else
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' >&2
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Arg parsing
+# ---------------------------------------------------------------------------
+RAW=0 KEEP_AUDIO=0 TEXT_INPUT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --raw)        RAW=1 ;;
+    --keep-audio) KEEP_AUDIO=1 ;;
+    --text)       shift; [[ $# -gt 0 ]] || die "--text requires an argument (or '-' for stdin)"
+                  if [[ "$1" == "-" ]]; then TEXT_INPUT="$(cat)"; else TEXT_INPUT="$1"; fi ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            die "unknown option: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------------------
+# Recording
+# ---------------------------------------------------------------------------
+record_audio() {
+  local out="$1" pid os
+  os="$(uname -s)"
+
+  local rec_out=/dev/null
+  [[ "$HAVE_TTY_OUT" == 1 ]] && rec_out=/dev/tty
+
+  if command -v rec >/dev/null 2>&1; then                     # sox
+    rec -q -c 1 -r 16000 "$out" > "$rec_out" 2>&1 &
+  elif command -v sox >/dev/null 2>&1; then
+    sox -q -d -c 1 -r 16000 "$out" > "$rec_out" 2>&1 &
+  elif command -v arecord >/dev/null 2>&1; then               # ALSA (Linux)
+    arecord -q -f S16_LE -r 16000 -c 1 "$out" &
+  elif command -v ffmpeg >/dev/null 2>&1; then
+    if [[ "$os" == "Darwin" ]]; then
+      ffmpeg -hide_banner -loglevel error -f avfoundation -i ":default" \
+        -ac 1 -ar 16000 -y "$out" &
+    else
+      ffmpeg -hide_banner -loglevel error -f pulse -i default \
+        -ac 1 -ar 16000 -y "$out" &
+    fi
+  else
+    die "no recorder found — install one of: sox (recommended), alsa-utils (arecord), ffmpeg"
+  fi
+  pid=$!
+
+  ui ""
+  ui "  ● Recording... press Enter to stop."
+  IFS= read -r _ < "$TTY_IN" || true
+
+  kill -INT "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  [[ -s "$out" ]] || die "recording produced no audio (is a microphone connected?)"
+}
+
+# ---------------------------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------------------------
+find_whisper_bin() {
+  local bin
+  for bin in whisper-cli whisper-cpp; do
+    if command -v "$bin" >/dev/null 2>&1; then printf '%s' "$bin"; return 0; fi
+  done
+  return 1
+}
+
+transcribe_local() {
+  local wav="$1" bin
+  bin="$(find_whisper_bin)" || die "no whisper.cpp binary found (whisper-cli / whisper-cpp)"
+  [[ -f "$WHISPER_MODEL" ]] || die "whisper model not found at: $WHISPER_MODEL
+Download one, e.g.:
+  mkdir -p \"$(dirname "$WHISPER_MODEL")\"
+  curl -L -o \"$WHISPER_MODEL\" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+or set RECORD_PROMPT_WHISPER_MODEL to an existing model path."
+  "$bin" -m "$WHISPER_MODEL" -f "$wav" -nt -np 2>/dev/null
+}
+
+transcribe_openai() {
+  local wav="$1" response
+  [[ -n "${OPENAI_API_KEY:-}" ]] || die "OPENAI_API_KEY not set (needed for the openai transcriber)"
+  response="$(curl -sS --max-time 120 https://api.openai.com/v1/audio/transcriptions \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -F model="${RECORD_PROMPT_OPENAI_STT_MODEL:-gpt-4o-mini-transcribe}" \
+    -F file=@"$wav")"
+  if [[ "$(printf '%s' "$response" | jq -r 'has("error")')" == "true" ]]; then
+    die "OpenAI transcription failed: $(printf '%s' "$response" | jq -r '.error.message')"
+  fi
+  printf '%s' "$response" | jq -r '.text'
+}
+
+transcribe() {
+  local wav="$1" mode="$TRANSCRIBER"
+  if [[ -z "$mode" ]]; then
+    if find_whisper_bin >/dev/null; then mode=local
+    elif [[ -n "${OPENAI_API_KEY:-}" ]]; then mode=openai
+    else
+      die "no transcriber available — install whisper.cpp (brew install whisper-cpp) or set OPENAI_API_KEY"
+    fi
+  fi
+  case "$mode" in
+    local)  transcribe_local "$wav" ;;
+    openai) transcribe_openai "$wav" ;;
+    *)      die "invalid RECORD_PROMPT_TRANSCRIBER: $mode (use 'local' or 'openai')" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Condensation via Claude Haiku
+# ---------------------------------------------------------------------------
+condense() {
+  local transcript="$1" payload response err_type
+  local -a auth_args
+
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    auth_args=(-H "x-api-key: $ANTHROPIC_API_KEY")
+  elif [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+    auth_args=(-H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" -H "anthropic-beta: oauth-2025-04-20")
+  else
+    die "no Anthropic credentials — export ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN via 'ant auth login')"
+  fi
+
+  payload="$(jq -n \
+    --arg model "$MODEL" \
+    --arg system "$SYSTEM_PROMPT" \
+    --arg transcript "$transcript" \
+    --argjson max_tokens "$MAX_TOKENS" \
+    '{model: $model, max_tokens: $max_tokens, system: $system,
+      messages: [{role: "user", content: $transcript}]}')"
+
+  response="$(curl -sS --max-time 90 https://api.anthropic.com/v1/messages \
+    -H "content-type: application/json" \
+    -H "anthropic-version: 2023-06-01" \
+    "${auth_args[@]}" \
+    -d "$payload")" || die "request to the Anthropic API failed (network?)"
+
+  err_type="$(printf '%s' "$response" | jq -r '.type // empty')"
+  if [[ "$err_type" == "error" ]]; then
+    die "Anthropic API error: $(printf '%s' "$response" | jq -r '.error.message')"
+  fi
+
+  printf '%s' "$response" | jq -r '[.content[] | select(.type == "text") | .text] | join("\n")'
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  local transcript
+
+  if [[ -n "$TEXT_INPUT" ]]; then
+    transcript="$TEXT_INPUT"
+  else
+    # Not `local`: the EXIT trap fires after main's scope is gone.
+    wav="$(mktemp "${TMPDIR:-/tmp}/record-prompt-XXXXXX.wav")"
+    if [[ "$KEEP_AUDIO" == 1 ]]; then
+      ui "  (audio kept at: $wav)"
+    else
+      trap 'rm -f "$wav"' EXIT
+    fi
+
+    record_audio "$wav"
+    ui "  ◌ Transcribing..."
+    transcript="$(transcribe "$wav")"
+  fi
+
+  # Trim whitespace
+  transcript="$(printf '%s' "$transcript" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [[ -n "$transcript" ]] || die "empty transcript — nothing to send"
+
+  if [[ "$RAW" == 1 ]]; then
+    printf '%s\n' "$transcript"
+    exit 0
+  fi
+
+  ui "  ◌ Condensing with $MODEL..."
+  local condensed
+  condensed="$(condense "$transcript")"
+  [[ -n "$condensed" ]] || die "condenser returned an empty response"
+
+  ui "  ✓ Done. Handing condensed prompt to Claude Code:"
+  ui ""
+
+  # The ONLY stdout of this script — this is what enters the model's context.
+  printf '%s\n' "$condensed"
+}
+
+main
