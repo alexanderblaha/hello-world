@@ -13,16 +13,20 @@
 # context, so every interactive/UI message here goes to /dev/tty instead —
 # the only bytes that ever reach the primary model are the final Haiku output.
 #
-# Condensation runs through the `claude` CLI when available (billed to your
-# Claude Pro/Max subscription — no API key needed), falling back to the
-# Anthropic API with ANTHROPIC_API_KEY otherwise.
+# Condenser backends (subscription-billed CLIs preferred over pay-per-token APIs):
+#   claude-cli   `claude -p`    — Claude Pro/Max subscription, no API key
+#   api          Anthropic API  — needs ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+#   codex        `codex exec`   — ChatGPT subscription via the OpenAI Codex CLI
+#   openai-api   OpenAI API     — needs OPENAI_API_KEY
 #
 # Environment:
-#   RECORD_PROMPT_CONDENSER      "claude-cli" or "api" (default: claude-cli if
-#                                the claude binary is on PATH, else api)
+#   RECORD_PROMPT_CONDENSER      backend above (default: first available in the
+#                                order claude-cli, api, codex, openai-api)
+#   RECORD_PROMPT_MODEL          condenser model (default depends on backend:
+#                                claude-haiku-4-5 for claude backends,
+#                                gpt-5-mini for openai-api, codex's own default)
 #   ANTHROPIC_API_KEY            only needed for the api condenser
 #                                (ANTHROPIC_AUTH_TOKEN from `ant auth login` also works)
-#   RECORD_PROMPT_MODEL          condenser model   (default: claude-haiku-4-5)
 #   RECORD_PROMPT_WHISPER_MODEL  path to a whisper.cpp ggml model
 #                                (default: ~/.local/share/whisper/ggml-base.en.bin)
 #   RECORD_PROMPT_TRANSCRIBER    "local" or "openai" (default: local, if a whisper
@@ -31,6 +35,12 @@
 #
 # Usage:
 #   record-prompt                 record → transcribe → condense → stdout
+#   record-prompt --condenser X   claude-cli | api | codex | openai-api
+#   record-prompt --model X       condenser model (haiku/sonnet/opus aliases OK)
+#   record-prompt --transcriber X local | openai
+#   record-prompt --compare SPECS run the same transcript through several
+#                                 condensers; SPECS = comma list of [backend:]model
+#                                 e.g. --compare "haiku,sonnet,opus,codex:gpt-5.5"
 #   record-prompt --raw           skip condensation; print the raw transcript
 #   record-prompt --text "..."    skip recording/transcription; condense the
 #                                 given text (also reads stdin: echo ... | record-prompt --text -)
@@ -39,7 +49,7 @@
 
 set -euo pipefail
 
-MODEL="${RECORD_PROMPT_MODEL:-claude-haiku-4-5}"
+MODEL="${RECORD_PROMPT_MODEL:-}"
 CONDENSER="${RECORD_PROMPT_CONDENSER:-}"
 WHISPER_MODEL="${RECORD_PROMPT_WHISPER_MODEL:-$HOME/.local/share/whisper/ggml-base.en.bin}"
 TRANSCRIBER="${RECORD_PROMPT_TRANSCRIBER:-}"
@@ -83,15 +93,19 @@ usage() {
 # ---------------------------------------------------------------------------
 # Arg parsing
 # ---------------------------------------------------------------------------
-RAW=0 KEEP_AUDIO=0 TEXT_INPUT=""
+RAW=0 KEEP_AUDIO=0 TEXT_INPUT="" COMPARE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --raw)        RAW=1 ;;
-    --keep-audio) KEEP_AUDIO=1 ;;
-    --text)       shift; [[ $# -gt 0 ]] || die "--text requires an argument (or '-' for stdin)"
-                  if [[ "$1" == "-" ]]; then TEXT_INPUT="$(cat)"; else TEXT_INPUT="$1"; fi ;;
-    -h|--help)    usage; exit 0 ;;
-    *)            die "unknown option: $1 (see --help)" ;;
+    --raw)         RAW=1 ;;
+    --keep-audio)  KEEP_AUDIO=1 ;;
+    --condenser)   shift; [[ $# -gt 0 ]] || die "--condenser requires an argument"; CONDENSER="$1" ;;
+    --model)       shift; [[ $# -gt 0 ]] || die "--model requires an argument"; MODEL="$1" ;;
+    --transcriber) shift; [[ $# -gt 0 ]] || die "--transcriber requires an argument"; TRANSCRIBER="$1" ;;
+    --compare)     shift; [[ $# -gt 0 ]] || die "--compare requires an argument"; COMPARE="$1" ;;
+    --text)        shift; [[ $# -gt 0 ]] || die "--text requires an argument (or '-' for stdin)"
+                   if [[ "$1" == "-" ]]; then TEXT_INPUT="$(cat)"; else TEXT_INPUT="$1"; fi ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             die "unknown option: $1 (see --help)" ;;
   esac
   shift
 done
@@ -187,23 +201,95 @@ transcribe() {
 }
 
 # ---------------------------------------------------------------------------
-# Condensation via Claude Haiku
+# Condensation backends
 # ---------------------------------------------------------------------------
+
+# Default model per backend when neither --model nor RECORD_PROMPT_MODEL is set.
+default_model_for() {
+  case "$1" in
+    claude-cli|api) printf 'claude-haiku-4-5' ;;
+    openai-api)     printf 'gpt-5-mini' ;;
+    codex)          printf '' ;;  # empty = use codex's configured default
+  esac
+}
+
+# Map short aliases to full Anthropic model IDs (the claude CLI accepts the
+# aliases natively; the raw API does not).
+anthropic_model_id() {
+  case "$1" in
+    haiku)  printf 'claude-haiku-4-5' ;;
+    sonnet) printf 'claude-sonnet-5' ;;
+    opus)   printf 'claude-opus-4-8' ;;
+    *)      printf '%s' "$1" ;;
+  esac
+}
+
+# Pick a backend for a bare model name in --compare specs.
+auto_backend_for_model() {
+  case "$1" in
+    haiku|sonnet|opus|claude*)
+      if command -v claude >/dev/null 2>&1; then printf 'claude-cli'; else printf 'api'; fi ;;
+    *)
+      if command -v codex >/dev/null 2>&1; then printf 'codex'; else printf 'openai-api'; fi ;;
+  esac
+}
 
 # Claude Code CLI in print mode — runs on your Claude Pro/Max subscription,
 # no API key required.
 condense_cli() {
-  local transcript="$1" out
+  local model="$1" transcript="$2" out
   out="$(printf '%s' "$transcript" | claude -p \
-    --model "$MODEL" \
+    --model "$model" \
     --system-prompt "$SYSTEM_PROMPT" \
-    2>/dev/null)" || die "claude CLI condensation failed — try 'claude /login', or set RECORD_PROMPT_CONDENSER=api"
+    2>/dev/null)" || die "claude CLI condensation failed — try 'claude /login', or --condenser api"
   printf '%s' "$out"
 }
 
-# Raw Messages API — needs ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN.
+# OpenAI Codex CLI in exec mode — runs on your ChatGPT subscription,
+# no API key required. --output-last-message isolates the answer from any
+# progress noise codex prints to stdout.
+condense_codex() {
+  local model="$1" transcript="$2" outfile out
+  command -v codex >/dev/null 2>&1 \
+    || die "codex CLI not found — npm install -g @openai/codex, then 'codex login' with your ChatGPT account"
+  outfile="$(mktemp "${TMPDIR:-/tmp}/record-prompt-codex-XXXXXX.txt")"
+  local -a args=(exec --skip-git-repo-check --output-last-message "$outfile")
+  [[ -n "$model" ]] && args+=(-m "$model")
+  if ! codex "${args[@]}" \
+      "$(printf '%s\n\n<transcript>\n%s\n</transcript>' "$SYSTEM_PROMPT" "$transcript")" \
+      >/dev/null 2>&1; then
+    rm -f "$outfile"
+    die "codex condensation failed — try 'codex login', or --condenser openai-api"
+  fi
+  out="$(cat "$outfile")"; rm -f "$outfile"
+  printf '%s' "$out"
+}
+
+# OpenAI API (pay-per-token) — needs OPENAI_API_KEY.
+condense_openai_api() {
+  local model="$1" transcript="$2" payload response
+  [[ -n "${OPENAI_API_KEY:-}" ]] || die "OPENAI_API_KEY not set (needed for the openai-api condenser)"
+  payload="$(jq -n \
+    --arg model "$model" \
+    --arg system "$SYSTEM_PROMPT" \
+    --arg transcript "$transcript" \
+    '{model: $model,
+      messages: [{role: "system", content: $system},
+                 {role: "user", content: $transcript}]}')"
+  response="$(curl -sS --max-time 90 https://api.openai.com/v1/chat/completions \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -H "content-type: application/json" \
+    -d "$payload")" || die "request to the OpenAI API failed (network?)"
+  if [[ "$(printf '%s' "$response" | jq -r 'has("error")')" == "true" ]]; then
+    die "OpenAI API error: $(printf '%s' "$response" | jq -r '.error.message')"
+  fi
+  printf '%s' "$response" | jq -r '.choices[0].message.content'
+}
+
+# Raw Anthropic Messages API — needs ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN.
 condense_api() {
-  local transcript="$1" payload response err_type
+  local model transcript="$2" payload response err_type
+  model="$(anthropic_model_id "$1")"
   local -a auth_args
 
   if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
@@ -215,7 +301,7 @@ condense_api() {
   fi
 
   payload="$(jq -n \
-    --arg model "$MODEL" \
+    --arg model "$model" \
     --arg system "$SYSTEM_PROMPT" \
     --arg transcript "$transcript" \
     --argjson max_tokens "$MAX_TOKENS" \
@@ -236,15 +322,25 @@ condense_api() {
   printf '%s' "$response" | jq -r '[.content[] | select(.type == "text") | .text] | join("\n")'
 }
 
-condense() {
-  local transcript="$1" mode="$CONDENSER"
-  if [[ -z "$mode" ]]; then
-    if command -v claude >/dev/null 2>&1; then mode=claude-cli; else mode=api; fi
+resolve_backend() {
+  if [[ -n "$CONDENSER" ]]; then printf '%s' "$CONDENSER"; return; fi
+  if command -v claude >/dev/null 2>&1; then printf 'claude-cli'
+  elif [[ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]]; then printf 'api'
+  elif command -v codex >/dev/null 2>&1; then printf 'codex'
+  elif [[ -n "${OPENAI_API_KEY:-}" ]]; then printf 'openai-api'
+  else
+    die "no condenser available — install the claude CLI (Claude subscription), the codex CLI (ChatGPT subscription), or export ANTHROPIC_API_KEY / OPENAI_API_KEY"
   fi
-  case "$mode" in
-    claude-cli) condense_cli "$transcript" ;;
-    api)        condense_api "$transcript" ;;
-    *)          die "invalid RECORD_PROMPT_CONDENSER: $mode (use 'claude-cli' or 'api')" ;;
+}
+
+condense() {
+  local backend="$1" model="$2" transcript="$3"
+  case "$backend" in
+    claude-cli) condense_cli "$model" "$transcript" ;;
+    api)        condense_api "$model" "$transcript" ;;
+    codex)      condense_codex "$model" "$transcript" ;;
+    openai-api) condense_openai_api "$model" "$transcript" ;;
+    *)          die "invalid condenser: $backend (use claude-cli, api, codex, or openai-api)" ;;
   esac
 }
 
@@ -279,9 +375,39 @@ main() {
     exit 0
   fi
 
-  ui "  ◌ Condensing with $MODEL..."
-  local condensed
-  condensed="$(condense "$transcript")"
+  # --compare: run the same transcript through several condensers, printing
+  # each labeled result. A failing backend reports its error (to the tty) and
+  # the comparison continues.
+  if [[ -n "$COMPARE" ]]; then
+    local spec backend model out
+    IFS=',' read -ra specs <<< "$COMPARE"
+    for spec in "${specs[@]}"; do
+      spec="${spec//[[:space:]]/}"
+      [[ -n "$spec" ]] || continue
+      if [[ "$spec" == *:* ]]; then
+        backend="${spec%%:*}"; model="${spec#*:}"
+      else
+        model="$spec"; backend="$(auto_backend_for_model "$model")"
+      fi
+      [[ -n "$model" ]] || model="$(default_model_for "$backend")"
+      ui "  ◌ Condensing with ${backend}:${model:-default}..."
+      printf '=== %s ===\n' "${backend}:${model:-default}"
+      if out="$(condense "$backend" "$model" "$transcript")"; then
+        printf '%s\n\n' "$out"
+      else
+        printf '[failed — see terminal for the error]\n\n'
+      fi
+    done
+    exit 0
+  fi
+
+  local backend model condensed
+  backend="$(resolve_backend)"
+  model="$MODEL"
+  [[ -n "$model" ]] || model="$(default_model_for "$backend")"
+
+  ui "  ◌ Condensing with ${backend}:${model:-default}..."
+  condensed="$(condense "$backend" "$model" "$transcript")"
   [[ -n "$condensed" ]] || die "condenser returned an empty response"
 
   ui "  ✓ Done. Handing condensed prompt to Claude Code:"

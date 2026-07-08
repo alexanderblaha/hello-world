@@ -75,21 +75,26 @@ curl -L -o ~/.local/share/whisper/ggml-base.en.bin \
 accurate enough for prompt dictation. Use `ggml-small.en.bin` if you dictate
 a lot of jargon (set `RECORD_PROMPT_WHISPER_MODEL` to its path).
 
-### 3. Credentials — none needed with a Claude subscription
+### 3. Credentials — subscriptions cover condensation, not transcription
 
-By default the script condenses through the `claude` CLI in print mode
-(`claude -p --model claude-haiku-4-5 ...`), which runs on your **Claude
-Pro/Max subscription** — if you're already logged in to Claude Code, there is
-nothing to configure and no API billing.
+Four condenser backends are supported; the two CLI backends bill against
+subscriptions you may already have, the two API backends are pay-per-token:
 
-To use the raw Anthropic API instead (pay-per-token):
+| Backend | Runs on | Billing |
+|---|---|---|
+| `claude-cli` (default) | `claude -p` | **Claude Pro/Max subscription** — no key needed |
+| `codex` | `codex exec` | **ChatGPT subscription** — no key needed (`npm i -g @openai/codex && codex login`) |
+| `api` | Anthropic Messages API | pay-per-token, needs `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) |
+| `openai-api` | OpenAI chat completions | pay-per-token, needs `OPENAI_API_KEY` |
 
-```sh
-export RECORD_PROMPT_CONDENSER=api
-export ANTHROPIC_API_KEY=sk-ant-...
-```
+If you're already logged in to Claude Code there is nothing to configure —
+the default condenses via your Claude subscription.
 
-(`ANTHROPIC_AUTH_TOKEN` from `ant auth login` also works for the api backend.)
+**Note on transcription:** a ChatGPT subscription does *not* include OpenAI
+API access, and OpenAI's speech-to-text has no subscription-backed CLI route —
+so cloud transcription is always pay-per-minute API usage. Local whisper.cpp
+(free) remains the recommended transcriber regardless of which condenser you
+pick.
 
 ### 4. Put it on your PATH
 
@@ -104,17 +109,38 @@ Or just invoke it by path from Claude Code: `! bin/record-prompt`.
 | Command | Effect |
 |---|---|
 | `record-prompt` | record → transcribe → condense → stdout |
-| `record-prompt --raw` | print the raw transcript (skip Haiku) — for debugging |
+| `record-prompt --condenser codex` | condense via ChatGPT subscription (also: `claude-cli`, `api`, `openai-api`) |
+| `record-prompt --model sonnet` | pick the condenser model (`haiku`/`sonnet`/`opus` aliases or any full model ID) |
+| `record-prompt --transcriber openai` | force cloud STT instead of local whisper |
+| `record-prompt --compare "haiku,sonnet,opus,codex:gpt-5.5"` | run the same transcript through several condensers, labeled side by side |
+| `record-prompt --raw` | print the raw transcript (skip condensing) — for debugging |
 | `record-prompt --text "..."` | condense given text (no mic needed) — for testing |
 | `echo "..." \| record-prompt --text -` | same, from stdin |
 | `record-prompt --keep-audio` | keep the temporary `.wav` |
 
+### Comparing condensers
+
+`--compare` takes a comma list of `[backend:]model` specs. A bare model name
+picks its backend automatically (`haiku`/`sonnet`/`opus`/`claude*` → claude,
+anything else → codex/openai). Record once, judge the outputs:
+
+```
+record-prompt --compare "haiku,sonnet,opus,codex:gpt-5.5"
+```
+
+Each result prints under a `=== backend:model ===` header; a backend that
+fails (not installed, not logged in) reports its error on the terminal and the
+comparison continues. Run comparisons standalone rather than via `!` — unless
+you *want* all variants in your Claude Code context.
+
 ## Configuration
+
+CLI flags (`--condenser`, `--model`, `--transcriber`) override the env vars.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `RECORD_PROMPT_CONDENSER` | auto (`claude-cli` if the `claude` binary is found, else `api`) | force `claude-cli` (subscription) or `api` (API key) |
-| `RECORD_PROMPT_MODEL` | `claude-haiku-4-5` | condenser model |
+| `RECORD_PROMPT_CONDENSER` | auto: first available of `claude-cli`, `api`, `codex`, `openai-api` | condenser backend |
+| `RECORD_PROMPT_MODEL` | per backend: `claude-haiku-4-5` (claude), `gpt-5-mini` (openai-api), codex's own default | condenser model |
 | `RECORD_PROMPT_WHISPER_MODEL` | `~/.local/share/whisper/ggml-base.en.bin` | whisper.cpp model path |
 | `RECORD_PROMPT_TRANSCRIBER` | auto (`local` if whisper found, else `openai`) | force `local` or `openai` |
 | `OPENAI_API_KEY` | — | enables the OpenAI audio-API fallback |
