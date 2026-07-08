@@ -32,6 +32,8 @@
 #   RECORD_PROMPT_TRANSCRIBER    "local" or "openai" (default: local, if a whisper
 #                                binary is found; otherwise openai if OPENAI_API_KEY set)
 #   OPENAI_API_KEY               only needed for the openai transcriber
+#   RECORD_PROMPT_MIC            (Windows/Git Bash only) dshow audio device name;
+#                                auto-detected if unset
 #
 # Usage:
 #   record-prompt                 record → transcribe → condense → stdout
@@ -113,9 +115,34 @@ done
 # ---------------------------------------------------------------------------
 # Recording
 # ---------------------------------------------------------------------------
+# Native Windows (Git Bash / MSYS): Unix signals don't reliably stop a
+# backgrounded recorder, so run ffmpeg in the foreground reading the tty —
+# ffmpeg stops cleanly (valid WAV header) when you press 'q'.
+record_audio_windows() {
+  local out="$1" dev="${RECORD_PROMPT_MIC:-}"
+  command -v ffmpeg >/dev/null 2>&1 \
+    || die "ffmpeg not found — install it: winget install Gyan.FFmpeg (then reopen the terminal)"
+  if [[ -z "$dev" ]]; then
+    dev="$(ffmpeg -hide_banner -list_devices true -f dshow -i dummy 2>&1 \
+      | sed -n 's/.*"\(.*\)" (audio)$/\1/p' | head -1)"
+    [[ -n "$dev" ]] || die "no audio input device found — list devices with:
+  ffmpeg -list_devices true -f dshow -i dummy
+then set RECORD_PROMPT_MIC=\"<device name>\""
+  fi
+  ui ""
+  ui "  ● Recording from \"$dev\"... press q to stop."
+  ffmpeg -hide_banner -loglevel error -f dshow -i audio="$dev" \
+    -ac 1 -ar 16000 -y "$out" < "$TTY_IN" >/dev/null 2>&1 || true
+  [[ -s "$out" ]] || die "recording produced no audio (check the device with RECORD_PROMPT_MIC)"
+}
+
 record_audio() {
   local out="$1" pid os
   os="$(uname -s)"
+
+  case "$os" in
+    MINGW*|MSYS*|CYGWIN*) record_audio_windows "$out"; return ;;
+  esac
 
   local rec_out=/dev/null
   [[ "$HAVE_TTY_OUT" == 1 ]] && rec_out=/dev/tty

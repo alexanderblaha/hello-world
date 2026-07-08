@@ -63,6 +63,34 @@ sudo apt install sox jq        # or: alsa-utils for arecord
 # https://github.com/ggerganov/whisper.cpp
 ```
 
+Windows — two options:
+
+**Option A (recommended): WSL2.** Run Claude Code and this script inside WSL;
+everything behaves like the Linux instructions above (`sudo apt install sox jq`,
+whisper.cpp from source or `brew install whisper-cpp` via Homebrew-on-Linux).
+Microphone access inside WSL2 comes through WSLg's PulseAudio passthrough
+(Windows 11, or Windows 10 with WSLg installed) — verify with `pactl info`;
+if a mic shows up, `sox`/`ffmpeg -f pulse` recording works.
+
+**Option B: native Git Bash.** Install the dependencies:
+
+```sh
+winget install Gyan.FFmpeg jqlang.jq
+```
+
+For whisper.cpp, download the Windows binary zip from the
+[whisper.cpp releases page](https://github.com/ggerganov/whisper.cpp/releases)
+and put `whisper-cli.exe` somewhere on your PATH. The script auto-detects
+Windows and records via ffmpeg's DirectShow capture — the recording prompt
+says **press `q` to stop** (instead of Enter), because that's how ffmpeg stops
+cleanly there. Your default microphone is auto-detected; to pick a specific
+one, list devices and set it:
+
+```sh
+ffmpeg -list_devices true -f dshow -i dummy   # shows "(audio)" device names
+export RECORD_PROMPT_MIC="Microphone (Realtek(R) Audio)"
+```
+
 ### 2. Whisper model (one-time, ~150 MB)
 
 ```sh
@@ -144,6 +172,7 @@ CLI flags (`--condenser`, `--model`, `--transcriber`) override the env vars.
 | `RECORD_PROMPT_WHISPER_MODEL` | `~/.local/share/whisper/ggml-base.en.bin` | whisper.cpp model path |
 | `RECORD_PROMPT_TRANSCRIBER` | auto (`local` if whisper found, else `openai`) | force `local` or `openai` |
 | `OPENAI_API_KEY` | — | enables the OpenAI audio-API fallback |
+| `RECORD_PROMPT_MIC` | auto-detected | (Windows/Git Bash only) DirectShow audio device name |
 | `RECORD_PROMPT_OPENAI_STT_MODEL` | `gpt-4o-mini-transcribe` | OpenAI STT model |
 
 ## Design decisions
