@@ -18,6 +18,17 @@ transcribes the audio, condenses it with Claude Haiku (`claude-haiku-4-5`,
 $1/$5 per MTok), and prints **only the condensed prompt** to stdout — which is
 exactly what Claude Code's `!` mode inserts into the primary model's context.
 
+## What this costs
+
+- **whisper.cpp: free.** Open source (MIT), model weights are a free download,
+  runs entirely on your machine — no account, no subscription, no per-use cost.
+- **Haiku condensation: covered by your Claude Pro/Max subscription** via the
+  `claude` CLI (the default). With the `api` backend it's pay-per-token
+  instead (`claude-haiku-4-5` at $1/$5 per MTok — a fraction of a cent per
+  recording).
+- **OpenAI transcription fallback (optional, off by default):**
+  ~$0.003–0.006/min. Never needed if whisper.cpp is installed.
+
 ## Why this saves real money
 
 The savings compound. Claude Code resends the full conversation on every
@@ -64,13 +75,21 @@ curl -L -o ~/.local/share/whisper/ggml-base.en.bin \
 accurate enough for prompt dictation. Use `ggml-small.en.bin` if you dictate
 a lot of jargon (set `RECORD_PROMPT_WHISPER_MODEL` to its path).
 
-### 3. Credentials
+### 3. Credentials — none needed with a Claude subscription
+
+By default the script condenses through the `claude` CLI in print mode
+(`claude -p --model claude-haiku-4-5 ...`), which runs on your **Claude
+Pro/Max subscription** — if you're already logged in to Claude Code, there is
+nothing to configure and no API billing.
+
+To use the raw Anthropic API instead (pay-per-token):
 
 ```sh
+export RECORD_PROMPT_CONDENSER=api
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-(`ANTHROPIC_AUTH_TOKEN` from `ant auth login` also works.)
+(`ANTHROPIC_AUTH_TOKEN` from `ant auth login` also works for the api backend.)
 
 ### 4. Put it on your PATH
 
@@ -94,6 +113,7 @@ Or just invoke it by path from Claude Code: `! bin/record-prompt`.
 
 | Env var | Default | Purpose |
 |---|---|---|
+| `RECORD_PROMPT_CONDENSER` | auto (`claude-cli` if the `claude` binary is found, else `api`) | force `claude-cli` (subscription) or `api` (API key) |
 | `RECORD_PROMPT_MODEL` | `claude-haiku-4-5` | condenser model |
 | `RECORD_PROMPT_WHISPER_MODEL` | `~/.local/share/whisper/ggml-base.en.bin` | whisper.cpp model path |
 | `RECORD_PROMPT_TRANSCRIBER` | auto (`local` if whisper found, else `openai`) | force `local` or `openai` |

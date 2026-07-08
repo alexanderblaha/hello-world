@@ -13,8 +13,15 @@
 # context, so every interactive/UI message here goes to /dev/tty instead —
 # the only bytes that ever reach the primary model are the final Haiku output.
 #
+# Condensation runs through the `claude` CLI when available (billed to your
+# Claude Pro/Max subscription — no API key needed), falling back to the
+# Anthropic API with ANTHROPIC_API_KEY otherwise.
+#
 # Environment:
-#   ANTHROPIC_API_KEY            required (or ANTHROPIC_AUTH_TOKEN from `ant auth login`)
+#   RECORD_PROMPT_CONDENSER      "claude-cli" or "api" (default: claude-cli if
+#                                the claude binary is on PATH, else api)
+#   ANTHROPIC_API_KEY            only needed for the api condenser
+#                                (ANTHROPIC_AUTH_TOKEN from `ant auth login` also works)
 #   RECORD_PROMPT_MODEL          condenser model   (default: claude-haiku-4-5)
 #   RECORD_PROMPT_WHISPER_MODEL  path to a whisper.cpp ggml model
 #                                (default: ~/.local/share/whisper/ggml-base.en.bin)
@@ -33,6 +40,7 @@
 set -euo pipefail
 
 MODEL="${RECORD_PROMPT_MODEL:-claude-haiku-4-5}"
+CONDENSER="${RECORD_PROMPT_CONDENSER:-}"
 WHISPER_MODEL="${RECORD_PROMPT_WHISPER_MODEL:-$HOME/.local/share/whisper/ggml-base.en.bin}"
 TRANSCRIBER="${RECORD_PROMPT_TRANSCRIBER:-}"
 MAX_TOKENS=500
@@ -181,7 +189,20 @@ transcribe() {
 # ---------------------------------------------------------------------------
 # Condensation via Claude Haiku
 # ---------------------------------------------------------------------------
-condense() {
+
+# Claude Code CLI in print mode — runs on your Claude Pro/Max subscription,
+# no API key required.
+condense_cli() {
+  local transcript="$1" out
+  out="$(printf '%s' "$transcript" | claude -p \
+    --model "$MODEL" \
+    --system-prompt "$SYSTEM_PROMPT" \
+    2>/dev/null)" || die "claude CLI condensation failed — try 'claude /login', or set RECORD_PROMPT_CONDENSER=api"
+  printf '%s' "$out"
+}
+
+# Raw Messages API — needs ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN.
+condense_api() {
   local transcript="$1" payload response err_type
   local -a auth_args
 
@@ -190,7 +211,7 @@ condense() {
   elif [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
     auth_args=(-H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" -H "anthropic-beta: oauth-2025-04-20")
   else
-    die "no Anthropic credentials — export ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN via 'ant auth login')"
+    die "no Anthropic credentials — export ANTHROPIC_API_KEY, or install the claude CLI to use your subscription instead"
   fi
 
   payload="$(jq -n \
@@ -213,6 +234,18 @@ condense() {
   fi
 
   printf '%s' "$response" | jq -r '[.content[] | select(.type == "text") | .text] | join("\n")'
+}
+
+condense() {
+  local transcript="$1" mode="$CONDENSER"
+  if [[ -z "$mode" ]]; then
+    if command -v claude >/dev/null 2>&1; then mode=claude-cli; else mode=api; fi
+  fi
+  case "$mode" in
+    claude-cli) condense_cli "$transcript" ;;
+    api)        condense_api "$transcript" ;;
+    *)          die "invalid RECORD_PROMPT_CONDENSER: $mode (use 'claude-cli' or 'api')" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
