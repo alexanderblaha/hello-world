@@ -76,11 +76,12 @@ if a mic shows up, `sox`/`ffmpeg -f pulse` recording works.
 You're on Option B without realizing it: Claude Code on native Windows executes
 `!` commands through Git Bash regardless of which shell hosts it, so
 `! bin/record-prompt` works from a PowerShell-hosted session once the Option B
-dependencies below are installed. One behavioral note: embedded terminals
-don't always give the script an interactive keyboard to receive the "stop"
-keypress — when that happens it automatically records for a fixed **30
-seconds** instead (it tells you so). Adjust with `--seconds N` (or
-`RECORD_PROMPT_SECONDS`): `! bin/record-prompt --seconds 60`.
+dependencies below are installed. Embedded terminals don't always give the
+script an interactive keyboard for a "stop" keypress — in that case it uses
+**silence auto-stop**: just talk, then stay quiet for ~2 seconds and the
+recording ends on its own. That needs sox installed (`scoop install sox` or
+`choco install sox.portable`); see "Stopping the recording" below for all
+three stop modes.
 
 **Option B: native Git Bash.** Install the dependencies:
 
@@ -142,6 +143,23 @@ ln -s "$(pwd)/bin/record-prompt" ~/.local/bin/record-prompt
 
 Or just invoke it by path from Claude Code: `! bin/record-prompt`.
 
+## Stopping the recording
+
+Three modes, chosen automatically but always overridable:
+
+1. **Keypress** — in a normal interactive terminal: press **Enter** (macOS/
+   Linux/WSL) or **q** (native Windows/ffmpeg) to stop. The default whenever
+   the script can read your keyboard.
+2. **Silence auto-stop** (`--silence`) — recording begins at your first word
+   and ends by itself after ~2 s of quiet (hard cap 300 s). Full control with
+   zero keyboard access, so it's the automatic choice in embedded terminals
+   (VS Code-hosted Claude Code, the desktop app). Requires sox. Tune with
+   `RECORD_PROMPT_SILENCE` (quiet seconds), `RECORD_PROMPT_SILENCE_LEVEL`
+   (threshold, default `3%` — raise it in noisy rooms), and
+   `RECORD_PROMPT_MAX_SECONDS` (cap).
+3. **Fixed duration** (`--seconds N`) — last resort, and the fallback only if
+   sox is missing in a non-interactive terminal.
+
 ## Usage
 
 | Command | Effect |
@@ -150,6 +168,7 @@ Or just invoke it by path from Claude Code: `! bin/record-prompt`.
 | `record-prompt --condenser codex` | condense via ChatGPT subscription (also: `claude-cli`, `api`, `openai-api`) |
 | `record-prompt --model sonnet` | pick the condenser model (`haiku`/`sonnet`/`opus` aliases or any full model ID) |
 | `record-prompt --transcriber openai` | force cloud STT instead of local whisper |
+| `record-prompt --silence` | stop automatically after ~2s of quiet (needs sox) |
 | `record-prompt --seconds 60` | record a fixed duration instead of waiting for a keypress |
 | `record-prompt --compare "haiku,sonnet,opus,codex:gpt-5.5"` | run the same transcript through several condensers, labeled side by side |
 | `record-prompt --raw` | print the raw transcript (skip condensing) — for debugging |
@@ -184,7 +203,10 @@ CLI flags (`--condenser`, `--model`, `--transcriber`) override the env vars.
 | `RECORD_PROMPT_TRANSCRIBER` | auto (`local` if whisper found, else `openai`) | force `local` or `openai` |
 | `OPENAI_API_KEY` | — | enables the OpenAI audio-API fallback |
 | `RECORD_PROMPT_MIC` | auto-detected | (Windows/Git Bash only) DirectShow audio device name |
-| `RECORD_PROMPT_SECONDS` | — (interactive stop) | fixed recording duration; auto-set to 30 when no interactive terminal |
+| `RECORD_PROMPT_SECONDS` | — | fixed recording duration |
+| `RECORD_PROMPT_SILENCE` | `2.0` | seconds of quiet that end a `--silence` recording |
+| `RECORD_PROMPT_SILENCE_LEVEL` | `3%` | amplitude below which audio counts as quiet |
+| `RECORD_PROMPT_MAX_SECONDS` | `300` | hard cap on a `--silence` recording |
 | `RECORD_PROMPT_OPENAI_STT_MODEL` | `gpt-4o-mini-transcribe` | OpenAI STT model |
 
 ## Design decisions
