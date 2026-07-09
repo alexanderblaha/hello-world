@@ -137,11 +137,21 @@ pick.
 
 ### 4. Put it on your PATH
 
+One command from the repo root (from Claude Code: `! bin/install`; from
+PowerShell: `bash bin/install`; from any other shell: `bin/install`):
+
 ```sh
-ln -s "$(pwd)/bin/record-prompt" ~/.local/bin/record-prompt
+bin/install
 ```
 
-Or just invoke it by path from Claude Code: `! bin/record-prompt`.
+On Windows this writes wrappers into `~/bin` (a bash wrapper plus a `.cmd`
+shim so it also works from PowerShell) and appends that folder to your
+**Windows user PATH** — restart VS Code afterwards, then `record-prompt`
+works everywhere, including `! record-prompt` in Claude Code. On
+macOS/Linux/WSL it symlinks into `~/.local/bin`. The wrappers point at this
+repo checkout, so `git pull` updates apply without reinstalling.
+
+Prefer not to install? Invoking by path always works: `! bin/record-prompt`.
 
 ## Stopping the recording
 

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+#
+# bin/install — put record-prompt on your PATH.
+#
+# Run once from the repo root:
+#   Git Bash / WSL / macOS / Linux:   bin/install
+#   From Claude Code:                 ! bin/install
+#   From PowerShell:                  bash bin/install
+#
+# What it does:
+#   - Windows (Git Bash/MSYS): writes ~/bin/record-prompt (bash wrapper) and
+#     ~/bin/record-prompt.cmd (PowerShell/cmd shim), then appends that folder
+#     to your *Windows user PATH* so VS Code, PowerShell, and Claude Code all
+#     see it. Restart VS Code afterwards to pick up the new PATH.
+#   - macOS/Linux/WSL: symlinks into ~/.local/bin and tells you if that isn't
+#     on your PATH.
+#
+# Wrappers exec the script from this repo checkout, so `git pull` updates are
+# picked up automatically — no reinstall needed.
+
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+target="$here/record-prompt"
+[[ -f "$target" ]] || { echo "error: $target not found" >&2; exit 1; }
+
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    dest_dir="$HOME/bin"
+    mkdir -p "$dest_dir"
+
+    # Wrapper for bash contexts (Claude Code ! mode, Git Bash)
+    printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$target" > "$dest_dir/record-prompt"
+    chmod +x "$dest_dir/record-prompt"
+
+    # Shim for PowerShell / cmd
+    target_win="$(cygpath -w "$target")"
+    printf '@echo off\r\nbash "%s" %%*\r\n' "$target_win" > "$dest_dir/record-prompt.cmd"
+
+    dest_win="$(cygpath -w "$dest_dir")"
+    echo "Installed:"
+    echo "  $dest_win\\record-prompt      (bash / Claude Code)"
+    echo "  $dest_win\\record-prompt.cmd  (PowerShell / cmd)"
+
+    # Append to the Windows *user* PATH if not already there (touches only
+    # the per-user value, never the system PATH).
+    if powershell.exe -NoProfile -Command "
+      \$dir = '$dest_win'
+      \$p = [Environment]::GetEnvironmentVariable('Path', 'User')
+      if ((\$p -split ';') -contains \$dir) { exit 10 }
+      [Environment]::SetEnvironmentVariable('Path', ((\$p.TrimEnd(';')) + ';' + \$dir), 'User')
+    " >/dev/null 2>&1; then
+      echo "Added $dest_win to your Windows user PATH."
+      echo "→ Restart VS Code (or open a new terminal) to pick it up, then run: record-prompt"
+    else
+      rc=$?
+      if [[ $rc -eq 10 ]]; then
+        echo "✓ $dest_win is already on your Windows user PATH — run: record-prompt"
+      else
+        echo "⚠ Couldn't update the PATH automatically. Add it yourself in PowerShell:"
+        echo "  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';$dest_win', 'User')"
+        echo "then restart VS Code."
+      fi
+    fi
+    ;;
+
+  *)
+    dest_dir="$HOME/.local/bin"
+    mkdir -p "$dest_dir"
+    ln -sf "$target" "$dest_dir/record-prompt"
+    echo "Symlinked $dest_dir/record-prompt → $target"
+    case ":$PATH:" in
+      *":$dest_dir:"*) echo "✓ $dest_dir is on your PATH — run: record-prompt" ;;
+      *) echo "⚠ $dest_dir is not on your PATH — add this to your shell profile:"
+         echo "  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+    ;;
+esac
