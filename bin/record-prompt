@@ -52,6 +52,15 @@
 #   record-prompt --raw           skip condensation; print the raw transcript
 #   record-prompt --text "..."    skip recording/transcription; condense the
 #                                 given text (also reads stdin: echo ... | record-prompt --text -)
+#   record-prompt --edit | -e     review the condensed prompt before it is
+#                                 printed: accept, edit in $EDITOR, or abort
+#                                 (needs an interactive terminal; ignored in
+#                                 embedded terminals like Claude Code ! mode)
+#   record-prompt --hold          don't print the prompt; write it to a file
+#                                 and print only the path, so you can review
+#                                 and edit it before telling the agent to
+#                                 read it (works without a terminal, unlike
+#                                 --edit)
 #   record-prompt --keep-audio    don't delete the temporary wav file
 #   record-prompt -h | --help     this help
 
@@ -94,25 +103,27 @@ die() { ui "record-prompt: error: $*"; exit 1; }
 
 usage() {
   if [[ "$HAVE_TTY_OUT" == 1 ]]; then
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' > /dev/tty
+    sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' > /dev/tty
   else
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' >&2
   fi
 }
 
 # ---------------------------------------------------------------------------
 # Arg parsing
 # ---------------------------------------------------------------------------
-RAW=0 KEEP_AUDIO=0 TEXT_INPUT="" COMPARE=""
+RAW=0 KEEP_AUDIO=0 TEXT_INPUT="" COMPARE="" EDIT=0 HOLD=0
 REC_SECONDS="${RECORD_PROMPT_SECONDS:-}"
 SILENCE_MODE=0
-SILENCE_TAIL="${RECORD_PROMPT_SILENCE:-2.0}"          # seconds of quiet that end the recording
-SILENCE_LEVEL="${RECORD_PROMPT_SILENCE_LEVEL:-3%}"    # sox amplitude threshold for "quiet"
+SILENCE_TAIL="${RECORD_PROMPT_SILENCE:-3.0}"          # seconds of quiet that end the recording
+SILENCE_LEVEL="${RECORD_PROMPT_SILENCE_LEVEL:-1%}"    # sox amplitude threshold for "quiet" (3% missed quiet mics' speech entirely — start gate never opened, so recording never stopped)
 MAX_SECONDS="${RECORD_PROMPT_MAX_SECONDS:-300}"       # safety cap in silence mode
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --raw)         RAW=1 ;;
     --keep-audio)  KEEP_AUDIO=1 ;;
+    --edit|-e)     EDIT=1 ;;
+    --hold)        HOLD=1 ;;
     --condenser)   shift; [[ $# -gt 0 ]] || die "--condenser requires an argument"; CONDENSER="$1" ;;
     --model)       shift; [[ $# -gt 0 ]] || die "--model requires an argument"; MODEL="$1" ;;
     --transcriber) shift; [[ $# -gt 0 ]] || die "--transcriber requires an argument"; TRANSCRIBER="$1" ;;
@@ -469,6 +480,65 @@ condense() {
 }
 
 # ---------------------------------------------------------------------------
+# Final output. Normally the prompt itself is the script's only stdout (what
+# enters the agent's context). With --hold, the prompt goes to a file instead
+# and stdout is just the path plus an instruction to wait — so the user can
+# review/edit the file before telling the agent to read it. Nothing about the
+# prompt's content may leak to stdout OR stderr in hold mode (no tty means
+# ui() writes to stderr, which the agent also captures).
+# ---------------------------------------------------------------------------
+emit_result() {
+  local text="$1"
+  if [[ "$HOLD" != 1 ]]; then
+    printf '%s\n' "$text"
+    return
+  fi
+  local hold_file="${TMPDIR:-/tmp}/record-prompt-held.txt" disp
+  printf '%s\n' "$text" > "$hold_file"
+  disp="$hold_file"
+  command -v cygpath >/dev/null 2>&1 && disp="$(cygpath -w "$hold_file")"
+  ui "  ✋ Prompt held for review: $disp"
+  printf '[prompt held for user review at: %s — the user will review/edit it first. Do not read that file or act until the user says to.]\n' "$disp"
+}
+
+# ---------------------------------------------------------------------------
+# Review (--edit): show the condensed prompt on the tty and let the user
+# accept it, rework it in $EDITOR, or abort. Sets REVIEWED_TEXT (no subshell,
+# so `die` still aborts the whole script). Requires a real terminal; in
+# embedded terminals (Claude Code ! mode) it degrades to a notice.
+# ---------------------------------------------------------------------------
+review_prompt() {
+  REVIEWED_TEXT="$1"
+  if [[ "$HAVE_TTY_OUT" != 1 || "$TTY_IN" != /dev/tty ]]; then
+    ui "  (--edit ignored: no interactive terminal to review on)"
+    return
+  fi
+  local ans tmp
+  ui ""
+  ui "  ── condensed prompt ─────────────────────────────────────────"
+  ui "$REVIEWED_TEXT"
+  ui "  ─────────────────────────────────────────────────────────────"
+  while :; do
+    printf '  Accept, edit, or quit? [Y/e/q] ' > /dev/tty
+    IFS= read -r ans < /dev/tty || ans=""
+    case "$ans" in
+      ""|y|Y) return ;;
+      e|E)
+        tmp="$(mktemp "${TMPDIR:-/tmp}/record-prompt-edit-XXXXXX.txt")"
+        printf '%s\n' "$REVIEWED_TEXT" > "$tmp"
+        "${EDITOR:-vi}" "$tmp" < /dev/tty > /dev/tty 2>&1 || true
+        REVIEWED_TEXT="$(sed -e 's/[[:space:]]*$//' "$tmp")"
+        rm -f "$tmp"
+        [[ -n "${REVIEWED_TEXT//[$'\n\t ']/}" ]] || die "edited prompt is empty — aborting"
+        return
+        ;;
+      q|Q) die "aborted at review — nothing sent" ;;
+      *)   ui "  (press Enter or y to accept, e to edit, q to quit)" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
@@ -495,7 +565,7 @@ main() {
   [[ -n "$transcript" ]] || die "empty transcript — nothing to send"
 
   if [[ "$RAW" == 1 ]]; then
-    printf '%s\n' "$transcript"
+    emit_result "$transcript"
     exit 0
   fi
 
@@ -534,11 +604,18 @@ main() {
   condensed="$(condense "$backend" "$model" "$transcript")"
   [[ -n "$condensed" ]] || die "condenser returned an empty response"
 
-  ui "  ✓ Done. Handing condensed prompt to Claude Code:"
-  ui ""
+  if [[ "$EDIT" == 1 ]]; then
+    review_prompt "$condensed"
+    condensed="$REVIEWED_TEXT"
+  fi
+
+  if [[ "$HOLD" != 1 ]]; then
+    ui "  ✓ Done. Handing condensed prompt to Claude Code:"
+    ui ""
+  fi
 
   # The ONLY stdout of this script — this is what enters the model's context.
-  printf '%s\n' "$condensed"
+  emit_result "$condensed"
 }
 
 main
