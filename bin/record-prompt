@@ -116,7 +116,7 @@ RAW=0 KEEP_AUDIO=0 TEXT_INPUT="" COMPARE="" EDIT=0 HOLD=0
 REC_SECONDS="${RECORD_PROMPT_SECONDS:-}"
 SILENCE_MODE=0
 SILENCE_TAIL="${RECORD_PROMPT_SILENCE:-5.0}"          # seconds of quiet that end the recording (5s tolerates mid-prompt composing pauses on noise-gating mics that slam to digital zero between phrases; override with RECORD_PROMPT_SILENCE)
-SILENCE_LEVEL="${RECORD_PROMPT_SILENCE_LEVEL:-1%}"    # sox amplitude threshold for "quiet" (3% missed quiet mics' speech entirely — start gate never opened, so recording never stopped)
+SILENCE_LEVEL="${RECORD_PROMPT_SILENCE_LEVEL:-0.1%}" # sox amplitude threshold for "quiet". 0.1% sits above a noise gate's true-zero floor (~0.003%) but below soft speech (~0.5%), so quiet passages aren't clipped as silence and the recording isn't cut off mid-phrase. (1% clipped soft speech; 3% also broke the start gate.) Raise back toward 1% only if you DISABLE the mic's hardware noise gate — then gaps become ambient noise, not zero, and a sub-ambient threshold would never trigger auto-stop.
 MAX_SECONDS="${RECORD_PROMPT_MAX_SECONDS:-300}"       # safety cap in silence mode
 while [[ $# -gt 0 ]]; do
   case "$1" in
